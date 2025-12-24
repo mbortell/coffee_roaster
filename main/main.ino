@@ -1,219 +1,210 @@
 /*
- * Coffee Roaster Firmware for Artisan
- * MAX31855 Thermocouple Amplifier
- * Arduino Uno
+ * Custom Coffee Roaster Firmware for Artisan
+ * 
+ * This sketch controls a coffee roaster based on a West Bend Poppery I,
+ * interfacing with Artisan roast logging software. It manages two 
+ * thermocouples, a variable-speed AC fan, and a heating element.
+ * 
+ * HARDWARE:
+ * - Arduino Uno
+ * - 2x K-Type Thermocouples with MAX31855 Breakouts
+ * - 1x RobotDyn AC Dimmer for fan motor (phase-angle control)
+ * - 1x Crydom D2425-10 SSR for fan
+ * - 1x Crydom D2425 SSR for heater (burst-fire control)
+ * 
+ * LIBRARIES:
+ * - Adafruit_MAX31855.h: For reading thermocouple temperatures.
+ * - RBDdimmer.h: For AC fan motor control.
+ *   NOTE: You must install the "RBDdimmer" library by RobotDyn from the
+ *   Arduino Library Manager for this code to compile.
  */
 
-#include "Adafruit_MAX31855.h"
+#include <Adafruit_MAX31855.h>
+#include <RBDdimmer.h> // Requires installation of RBDdimmer library
 
-// ============================================================================
-// PIN DEFINITIONS
-// ============================================================================
-#define MAXCS_BT    10    // Chip Select for Bean Temperature thermocouple
-#define HEATER_PIN  8     // Digital pin to control heater relay (optional)
+// ============================================================================ 
+// PIN DEFINITIONS (Mandatory)
+// ============================================================================ 
+// Shared SPI for Thermocouples (Software SPI)
+#define MAXDO   3  // Data Out
+#define MAXCLK  5  // Clock
 
-// ============================================================================
+// Chip Select (CS) for individual thermocouples
+#define CS_ET   4  // Environmental Temp (ET)
+#define CS_BT   6  // Bean Temp (BT)
+
+// AC Dimmer for Fan Control
+#define ZC_PIN  2  // Zero-Cross Detection (MUST be on an interrupt pin)
+#define FAN_PIN 7  // PSM/DIM Pin for dimmer control
+
+// ============================================================================ 
 // CONFIGURATION
-// ============================================================================
-#define BAUD_RATE       115200  // Serial communication speed
-#define READ_INTERVAL   500     // Milliseconds between readings
-#define ARTISAN_FORMAT  true    // Format output for Artisan compatibility
+// ============================================================================ 
+#define BAUD_RATE       115200 // Serial communication speed for Artisan
+#define READ_INTERVAL   500    // Milliseconds between sensor readings
 
-// ============================================================================
+// ============================================================================ 
 // GLOBAL OBJECTS
-// ============================================================================
-Adafruit_MAX31855 thermoBT(MAXCS_BT);  // Bean Temperature sensor
+// ============================================================================ 
+// Initialize thermocouples using software SPI
+Adafruit_MAX31855 thermo_et(MAXCLK, CS_ET, MAXDO); // Environmental Temp
+Adafruit_MAX31855 thermo_bt(MAXCLK, CS_BT, MAXDO); // Bean Temp
 
-// ============================================================================
+// Initialize AC dimmer for the fan
+// NOTE: The ZC_PIN (2) is handled by the library's interrupt setup.
+dimmerLamp dimmer(FAN_PIN); 
+
+// ============================================================================ 
 // GLOBAL VARIABLES
-// ============================================================================
+// ============================================================================ 
 unsigned long lastReadTime = 0;
-bool heaterState = false;
+String commandString = "";
+bool commandComplete = false;
 
-// ============================================================================
-// FUNCTION PROTOTYPES
-// ============================================================================
-void readAndSendTemperature();
-void handleThermocoupleError(uint8_t error);
-void processSerialCommand();
-void parsePIDCommand(String command);
+// Power levels (0-100%)
+int heater_power = 0;
+int fan_power = 0;
 
-// ============================================================================
+// ============================================================================ 
 // SETUP - Runs once at startup
-// ============================================================================
+// ============================================================================ 
 void setup() {
-  // Initialize serial communication
   Serial.begin(BAUD_RATE);
-  
-  // Initialize heater control pin (optional)
+  commandString.reserve(20); // Pre-allocate memory for serial commands
+
+  // Initialize Heater Pin
   pinMode(HEATER_PIN, OUTPUT);
   digitalWrite(HEATER_PIN, LOW);
+
+  // Initialize Fan Dimmer
+  dimmer.begin(NORMAL_MODE, ON); // Start in normal mode, with output on
+  dimmer.setPower(0); // Start with fan off
+
+  // Initialize Thermocouples
+  delay(500); // Wait for MAX31855s to stabilize
   
-  // Wait for MAX31855 to stabilize
-  delay(500);
-  
-  // Send startup message
-  Serial.println("# Coffee Roaster Ready");
-  Serial.println("# Firmware v1.0");
-  
-  // Verify thermocouple connection
-  if (isnan(thermoBT.readCelsius())) {
-    Serial.println("# WARNING: Check thermocouple connection!");
-  }
+  Serial.println("# Coffee Roaster Ready. Waiting for Artisan commands.");
 }
 
-// ============================================================================
+// ============================================================================ 
 // MAIN LOOP - Runs continuously
-// ============================================================================
+// ============================================================================ 
 void loop() {
-  // Check if it's time to read temperature
-  unsigned long currentTime = millis();
-  if (currentTime - lastReadTime >= READ_INTERVAL) {
-    lastReadTime = currentTime;
-    
-    // Read and send temperature
-    readAndSendTemperature();
+  // 1. Check for and parse incoming serial commands from Artisan
+  processSerialCommands();
+
+  // 2. Send temperature data to Artisan every READ_INTERVAL
+  if (millis() - lastReadTime >= READ_INTERVAL) {
+    lastReadTime = millis();
+    readAndSendTemperatures();
   }
-  
-  // Check for incoming commands from Artisan
-  if (Serial.available() > 0) {
-    processSerialCommand();
-  }
+
+  // 3. Update hardware based on power variables
+  updateFan();
+  updateHeater();
 }
 
-// ============================================================================
-// TEMPERATURE READING FUNCTION
-// ============================================================================
-void readAndSendTemperature() {
-  // Read temperature in Celsius
-  double tempC = thermoBT.readCelsius();
-  
-  // Check for sensor errors
-  uint8_t error = thermoBT.readError();
-  
-  if (error != 0) {
-    // Handle thermocouple errors
-    handleThermocoupleError(error);
-    return;
-  }
-  
-  // Check for invalid reading (NaN)
-  if (isnan(tempC)) {
-    Serial.println("# ERROR: Invalid temperature reading");
-    return;
-  }
-  
-  // Optional: Read internal temperature (cold junction compensation)
-  double tempInternal = thermoBT.readInternal();
-  
-  // Send data to Artisan
-  if (ARTISAN_FORMAT) {
-    // Artisan expects: BT,ET format (Bean Temp, Environment Temp)
-    // If you only have one sensor, send BT and use internal temp for ET
-    Serial.print(tempC, 2);
-    Serial.print(",");
-    Serial.println(tempInternal, 2);
-  } else {
-    // Simple format: just the temperature
-    Serial.println(tempC, 2);
-  }
-}
-
-// ============================================================================
-// ERROR HANDLING FUNCTION
-// ============================================================================
-void handleThermocoupleError(uint8_t error) {
-  Serial.print("# ERROR: ");
-  
-  if (error & MAX31855_FAULT_OPEN) {
-    Serial.println("Thermocouple open circuit - check connections");
-  }
-  else if (error & MAX31855_FAULT_SHORT_GND) {
-    Serial.println("Thermocouple short to ground");
-  }
-  else if (error & MAX31855_FAULT_SHORT_VCC) {
-    Serial.println("Thermocouple short to VCC");
-  }
-  else {
-    Serial.println("Unknown thermocouple fault");
-  }
-}
-
-// ============================================================================
+// ============================================================================ 
 // SERIAL COMMAND PROCESSING
-// ============================================================================
-void processSerialCommand() {
-  String command = Serial.readStringUntil('\n');
-  command.trim();  // Remove whitespace
-  
-  // Convert to uppercase for easier parsing
-  command.toUpperCase();
-  
-  // Process commands
-  if (command == "READ") {
-    // Force immediate temperature reading
-    readAndSendTemperature();
-  }
-  else if (command.startsWith("CHAN")) {
-    // Artisan sometimes sends CHAN;xxxx to select channels
-    // Acknowledge the command
-    Serial.println("# OK");
-  }
-  else if (command.startsWith("PID")) {
-    // PID control commands (if implementing heater control)
-    // Format: PID;SV;123.4
-    parsePIDCommand(command);
-  }
-  else if (command == "HEATER;ON") {
-    // Turn heater on
-    digitalWrite(HEATER_PIN, HIGH);
-    heaterState = true;
-    Serial.println("# Heater ON");
-  }
-  else if (command == "HEATER;OFF") {
-    // Turn heater off
-    digitalWrite(HEATER_PIN, LOW);
-    heaterState = false;
-    Serial.println("# Heater OFF");
-  }
-  else if (command == "UNITS;F") {
-    // Note: This firmware always sends Celsius
-    // Artisan handles the conversion
-    Serial.println("# Celsius mode");
-  }
-  else if (command == "UNITS;C") {
-    Serial.println("# Celsius mode");
-  }
-  else {
-    // Unknown command - acknowledge anyway
-    Serial.println("# OK");
-  }
-}
-
-// ============================================================================
-// PID COMMAND PARSER (for advanced heater control)
-// ============================================================================
-void parsePIDCommand(String command) {
-  // Example: PID;SV;200.5 (Set Value to 200.5°C)
-  // This is a placeholder for implementing PID-controlled heating
-  
-  int firstSemicolon = command.indexOf(';');
-  int secondSemicolon = command.indexOf(';', firstSemicolon + 1);
-  
-  if (secondSemicolon > 0) {
-    String pidType = command.substring(firstSemicolon + 1, secondSemicolon);
-    String value = command.substring(secondSemicolon + 1);
-    
-    if (pidType == "SV") {
-      // Set Value received - this is the target temperature
-      float targetTemp = value.toFloat();
-      Serial.print("# Target temperature set: ");
-      Serial.println(targetTemp);
-      
-      // Here you would implement PID logic to control heater
-      // based on current temp vs target temp
+// ============================================================================ 
+void processSerialCommands() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar == '\n') {
+      commandComplete = true;
+    } else {
+      commandString += inChar;
     }
   }
-  
-  Serial.println("# OK");
+
+  if (commandComplete) {
+    commandString.trim();
+    // Artisan commands for heater/fan are "OT1;value" and "OT2;value"
+    if (commandString.startsWith("OT1")) {
+      int separator = commandString.indexOf(';');
+      if (separator > 0) {
+        String valueStr = commandString.substring(separator + 1);
+        heater_power = valueStr.toInt();
+        heater_power = constrain(heater_power, 0, 100); // Ensure 0-100 range
+      }
+    } else if (commandString.startsWith("OT2")) {
+      int separator = commandString.indexOf(';');
+      if (separator > 0) {
+        String valueStr = commandString.substring(separator + 1);
+        fan_power = valueStr.toInt();
+        fan_power = constrain(fan_power, 0, 100); // Ensure 0-100 range
+      }
+    }
+    // Acknowledge other common Artisan commands
+    else if (commandString.startsWith("CHAN") || commandString.startsWith("UNITS")) {
+       Serial.println("# OK");
+    }
+    
+    commandString = "";
+    commandComplete = false;
+  }
+}
+
+// ============================================================================ 
+// TEMPERATURE READING & SENDING
+// ============================================================================ 
+void readAndSendTemperatures() {
+  // Read temperatures
+  double bt = thermo_bt.readCelsius();
+  double et = thermo_et.readCelsius();
+
+  // --- Basic Error Handling ---
+  // Check for NaN (Not-a-Number) which indicates a read failure
+  if (isnan(bt)) {
+    // You could use a previous value or send an error code.
+    // For simplicity, we'll send 0.00, but log an error.
+    Serial.println("# WARNING: Bean Temp (BT) sensor read failed (NaN).");
+    bt = 0.00;
+  }
+  if (isnan(et)) {
+    Serial.println("# WARNING: Environment Temp (ET) sensor read failed (NaN).");
+    et = 0.00;
+  }
+
+  // Check for other MAX31855 fault conditions
+  uint8_t bt_error = thermo_bt.readError();
+  uint8_t et_error = thermo_et.readError();
+  if (bt_error) {
+    Serial.print("# WARNING: BT Fault: ");
+    if (bt_error & MAX31855_FAULT_OPEN) Serial.println("Open Circuit");
+    else if (bt_error & MAX31855_FAULT_SHORT_GND) Serial.println("Short to GND");
+    else if (bt_error & MAX31855_FAULT_SHORT_VCC) Serial.println("Short to VCC");
+  }
+   if (et_error) {
+    Serial.print("# WARNING: ET Fault: ");
+    if (et_error & MAX31855_FAULT_OPEN) Serial.println("Open Circuit");
+    else if (et_error & MAX31855_FAULT_SHORT_GND) Serial.println("Short to GND");
+    else if (et_error & MAX31855_FAULT_SHORT_VCC) Serial.println("Short to VCC");
+  }
+
+  // Send data in Artisan-compatible CSV format: "BT,ET"
+  Serial.print(bt, 2);
+  Serial.print(",");
+  Serial.println(et, 2);
+}
+
+// ============================================================================ 
+// HARDWARE CONTROL FUNCTIONS
+// ============================================================================ 
+void updateFan() {
+  // The RBDdimmer library takes a power value from 0-100
+  dimmer.setPower(fan_power);
+}
+
+void updateHeater() {
+  // --- SAFETY CHECK ---
+  // Do not allow the heater to run if the fan is off.
+  if (fan_power == 0) {
+    heater_power = 0;
+  }
+
+  // Convert power percentage (0-100) to PWM duty cycle (0-255)
+  // This provides a simple "Burst Fire" or Integral Cycle control for the SSR
+  int heater_pwm = map(heater_power, 0, 100, 0, 255);
+  analogWrite(HEATER_PIN, heater_pwm);
 }
